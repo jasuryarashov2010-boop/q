@@ -11,10 +11,6 @@ import os
 import re
 import secrets
 import tempfile
-from aiogram.filters import Command, CommandStart, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.filters import Command, CommandStart
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -975,6 +971,9 @@ router = Router()
 bot: Optional[Bot] = None
 dp: Optional[Dispatcher] = None
 polling_task: Optional[asyncio.Task] = None
+
+# FastAPI app must exist before decorators below
+app = FastAPI(title=settings.APP_NAME, version="3.0.0")
 
 # =========================================================
 # TELEGRAM HANDLERS
@@ -1951,7 +1950,7 @@ async def lifespan(app: FastAPI):
         await bot.session.close()
 
 
-app = FastAPI(title=settings.APP_NAME, version="3.0.0", lifespan=lifespan)
+app.router.lifespan_context = lifespan
 
 # =========================================================
 # MAIN
