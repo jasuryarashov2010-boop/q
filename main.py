@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import tempfile
+from aiogram.filters import Command, CommandStart
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
