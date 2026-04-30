@@ -1924,18 +1924,18 @@ async def start_polling_background() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global bot, dp, polling_task
+
     await init_db()
     await seed_default_tests()
     await setup_bot()
 
-    global polling_task
     if settings.BOT_TOKEN and not settings.WEBHOOK_URL and dp and bot:
         polling_task = asyncio.create_task(start_polling_background())
         logger.info("Polling task started.")
 
     yield
 
-    global bot
     if polling_task and not polling_task.done():
         polling_task.cancel()
     if bot and settings.WEBHOOK_URL:
