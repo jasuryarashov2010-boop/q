@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import ast
+import asyncio
 import html
 import io
 import json
@@ -12,6 +12,7 @@ import re
 import secrets
 import tempfile
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
@@ -23,19 +24,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from aiogram import Bot, Dispatcher, F, Router, types
-from aiogram.enums import ChatAction, ParseMode
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    FSInputFile,
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, FSInputFile
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 
 from sqlalchemy import (
@@ -57,9 +52,9 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column, relationship
 
-# =========================
+# =========================================================
 # SETTINGS
-# =========================
+# =========================================================
 
 class Settings:
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
@@ -76,14 +71,11 @@ class Settings:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").strip().upper()
     AI_PROVIDER: str = os.getenv("AI_PROVIDER", "auto").strip().lower()
     APP_NAME: str = os.getenv("APP_NAME", "math_tekshiruvchi_bot").strip()
-    SESSION_TTL_SECONDS: int = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
     MAX_TESTS_PER_PAGE: int = int(os.getenv("MAX_TESTS_PER_PAGE", "6"))
     RATE_LIMIT_MESSAGES: int = int(os.getenv("RATE_LIMIT_MESSAGES", "12"))
     RATE_LIMIT_WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "8"))
     CERTIFICATE_THRESHOLD: int = int(os.getenv("CERTIFICATE_THRESHOLD", "85"))
     XP_PER_CORRECT: int = int(os.getenv("XP_PER_CORRECT", "10"))
-    XP_BONUS_FAST: int = int(os.getenv("XP_BONUS_FAST", "15"))
-    DAILY_CHALLENGE_MIN_TESTS: int = int(os.getenv("DAILY_CHALLENGE_MIN_TESTS", "1"))
 
     @property
     def admin_ids(self) -> set[int]:
@@ -97,9 +89,10 @@ class Settings:
 
 settings = Settings()
 
-# =========================
+# =========================================================
 # LOGGING
-# =========================
+# =========================================================
+
 
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger(settings.APP_NAME)
@@ -116,12 +109,14 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
-# =========================
+# =========================================================
 # HELPERS
-# =========================
+# =========================================================
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def iso(dt: Optional[datetime]) -> str:
     if not dt:
@@ -130,36 +125,36 @@ def iso(dt: Optional[datetime]) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.strftime("%Y-%m-%d %H:%M UTC")
 
+
 def safe_int(v: Any, default: int = 0) -> int:
     try:
         return int(v)
     except Exception:
         return default
 
+
 def clamp(n: int, low: int, high: int) -> int:
     return max(low, min(high, n))
+
 
 def esc(text: Any) -> str:
     return html.escape("" if text is None else str(text))
 
-def mask_secret(value: str, keep: int = 4) -> str:
-    if not value:
-        return ""
-    if len(value) <= keep:
-        return "*" * len(value)
-    return value[:keep] + "*" * (len(value) - keep)
 
-def chunked(seq: List[Any], size: int) -> List[List[Any]]:
-    return [seq[i : i + size] for i in range(0, len(seq), size)]
+def sanitize_text(text: str) -> str:
+    return re.sub(r"[ \t]+", " ", (text or "")).strip()
+
 
 def percent(correct: int, total: int) -> int:
     return 0 if total <= 0 else round((correct / total) * 100)
+
 
 def level_from_xp(xp: int) -> Tuple[int, int, int]:
     lvl = max(1, xp // 100 + 1)
     current = (lvl - 1) * 100
     next_ = lvl * 100
     return lvl, xp - current, next_ - current
+
 
 def badge_from_level(level: int) -> str:
     if level >= 20:
@@ -172,17 +167,13 @@ def badge_from_level(level: int) -> str:
         return "⭐ Rising"
     return "🌱 Starter"
 
-def sanitize_text(text: str) -> str:
-    text = text or ""
-    text = re.sub(r"[ \t]+", " ", text).strip()
-    return text
 
 def parse_answers(raw: str) -> List[str]:
     raw = sanitize_text(raw).upper()
     if not raw:
         return []
-    tokens = re.findall(r"[A-D]|[1-9]\d*", raw)
-    return tokens
+    return re.findall(r"[A-D]|[1-9]\d*", raw)
+
 
 def parse_test_code_and_answers(raw: str) -> Tuple[str, str]:
     raw = sanitize_text(raw)
@@ -192,6 +183,7 @@ def parse_test_code_and_answers(raw: str) -> Tuple[str, str]:
     if len(parts) == 1:
         return parts[0].upper(), ""
     return parts[0].upper(), parts[1]
+
 
 def safe_json_loads(value: Any, default: Any) -> Any:
     try:
@@ -203,13 +195,14 @@ def safe_json_loads(value: Any, default: Any) -> Any:
     except Exception:
         return default
 
-# =========================
+# =========================================================
 # DATABASE
-# =========================
+# =========================================================
 
 Base = declarative_base()
 engine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
 
 class User(Base):
     __tablename__ = "users"
@@ -232,6 +225,7 @@ class User(Base):
     results: Mapped[List["Result"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     favorites: Mapped[List["Favorite"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
+
 class Test(Base):
     __tablename__ = "tests"
 
@@ -250,6 +244,7 @@ class Test(Base):
 
     results: Mapped[List["Result"]] = relationship(back_populates="test", cascade="all, delete-orphan")
     favorites: Mapped[List["Favorite"]] = relationship(back_populates="test", cascade="all, delete-orphan")
+
 
 class Result(Base):
     __tablename__ = "results"
@@ -271,6 +266,7 @@ class Result(Base):
     user: Mapped["User"] = relationship(back_populates="results")
     test: Mapped["Test"] = relationship(back_populates="results")
 
+
 class Attempt(Base):
     __tablename__ = "attempts"
 
@@ -281,6 +277,7 @@ class Attempt(Base):
     duplicate: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
+
 class MessageLog(Base):
     __tablename__ = "messages"
 
@@ -289,6 +286,7 @@ class MessageLog(Base):
     direction: Mapped[str] = mapped_column(String(16), default="in")
     text: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
 
 class AdminLog(Base):
     __tablename__ = "admin_logs"
@@ -299,6 +297,7 @@ class AdminLog(Base):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
+
 class AnalyticsEvent(Base):
     __tablename__ = "analytics"
 
@@ -306,6 +305,7 @@ class AnalyticsEvent(Base):
     name: Mapped[str] = mapped_column(String(128), index=True)
     data: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
 
 class Certificate(Base):
     __tablename__ = "certificates"
@@ -317,6 +317,7 @@ class Certificate(Base):
     pdf_path: Mapped[str] = mapped_column(String(500), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
+
 class Badge(Base):
     __tablename__ = "badges"
 
@@ -324,6 +325,7 @@ class Badge(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(128), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
 
 class Streak(Base):
     __tablename__ = "streaks"
@@ -333,6 +335,7 @@ class Streak(Base):
     current: Mapped[int] = mapped_column(Integer, default=0)
     best: Mapped[int] = mapped_column(Integer, default=0)
     last_active_day: Mapped[str] = mapped_column(String(16), default="")
+
 
 class Favorite(Base):
     __tablename__ = "favorites"
@@ -346,6 +349,7 @@ class Favorite(Base):
     user: Mapped["User"] = relationship(back_populates="favorites")
     test: Mapped["Test"] = relationship(back_populates="favorites")
 
+
 class Notification(Base):
     __tablename__ = "notifications"
 
@@ -356,17 +360,6 @@ class Notification(Base):
     read: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-# =========================
-# APP STATE / CACHE
-# =========================
-
-recent_messages: Dict[int, List[float]] = defaultdict(list)
-user_filter_state: Dict[int, Dict[str, Any]] = defaultdict(dict)
-pending_contact: Dict[int, bool] = defaultdict(bool)
-pending_admin_action: Dict[int, str] = defaultdict(str)
-pending_payload: Dict[int, dict] = defaultdict(dict)
-active_sessions: Dict[int, dict] = defaultdict(dict)
-last_test_opened: Dict[int, int] = defaultdict(int)
 
 DEFAULT_TESTS: List[dict] = [
     {
@@ -379,24 +372,9 @@ DEFAULT_TESTS: List[dict] = [
         "preview_text": "Kasrlar bo‘yicha 1-topshiriq. Bir nechta misollar va qisqa test.",
         "max_score": 20,
         "answer_key": [
-            {
-                "question": "1/2 + 1/4 = ?",
-                "options": ["1/3", "3/4", "2/4", "5/4"],
-                "correct": "B",
-                "explanation": "1/2 = 2/4, 2/4 + 1/4 = 3/4."
-            },
-            {
-                "question": "3/5 - 1/5 = ?",
-                "options": ["2/5", "4/5", "1/5", "3/10"],
-                "correct": "A",
-                "explanation": "Maxraj bir xil, suratlar ayiriladi."
-            },
-            {
-                "question": "2/3 × 3/4 = ?",
-                "options": ["1/2", "5/12", "6/7", "1/4"],
-                "correct": "A",
-                "explanation": "2/3 × 3/4 = 6/12 = 1/2."
-            }
+            {"question": "1/2 + 1/4 = ?", "options": ["1/3", "3/4", "2/4", "5/4"], "correct": "B", "explanation": "1/2 = 2/4, 2/4 + 1/4 = 3/4."},
+            {"question": "3/5 - 1/5 = ?", "options": ["2/5", "4/5", "1/5", "3/10"], "correct": "A", "explanation": "Maxraj bir xil, suratlar ayiriladi."},
+            {"question": "2/3 × 3/4 = ?", "options": ["1/2", "5/12", "6/7", "1/4"], "correct": "A", "explanation": "2/3 × 3/4 = 6/12 = 1/2."},
         ],
     },
     {
@@ -409,24 +387,9 @@ DEFAULT_TESTS: List[dict] = [
         "preview_text": "Algebra bo‘yicha asosiy qoida va tenglama testlari.",
         "max_score": 30,
         "answer_key": [
-            {
-                "question": "x + 5 = 12, x = ?",
-                "options": ["5", "6", "7", "8"],
-                "correct": "C",
-                "explanation": "x = 12 - 5 = 7."
-            },
-            {
-                "question": "2x = 14, x = ?",
-                "options": ["5", "6", "7", "8"],
-                "correct": "C",
-                "explanation": "Ikkala tomonni 2 ga bo‘lamiz."
-            },
-            {
-                "question": "x^2 = 49, x ning musbat qiymati?",
-                "options": ["5", "6", "7", "8"],
-                "correct": "C",
-                "explanation": "7^2 = 49."
-            }
+            {"question": "x + 5 = 12, x = ?", "options": ["5", "6", "7", "8"], "correct": "C", "explanation": "x = 12 - 5 = 7."},
+            {"question": "2x = 14, x = ?", "options": ["5", "6", "7", "8"], "correct": "C", "explanation": "Ikkala tomonni 2 ga bo‘lamiz."},
+            {"question": "x^2 = 49, x ning musbat qiymati?", "options": ["5", "6", "7", "8"], "correct": "C", "explanation": "7^2 = 49."},
         ],
     },
     {
@@ -439,51 +402,27 @@ DEFAULT_TESTS: List[dict] = [
         "preview_text": "Mexanik ish va kuch bo‘yicha qisqa test.",
         "max_score": 30,
         "answer_key": [
-            {
-                "question": "Ish formulasi qaysi?",
-                "options": ["A = F / s", "A = F × s", "A = m × g", "A = v / t"],
-                "correct": "B",
-                "explanation": "Ish = kuch × yo‘l."
-            },
-            {
-                "question": "Kuch birligi?",
-                "options": ["Joul", "Nyuton", "Vatt", "Metr"],
-                "correct": "B",
-                "explanation": "Kuch birligi — Nyuton."
-            }
+            {"question": "Ish formulasi qaysi?", "options": ["A = F / s", "A = F × s", "A = m × g", "A = v / t"], "correct": "B", "explanation": "Ish = kuch × yo‘l."},
+            {"question": "Kuch birligi?", "options": ["Joul", "Nyuton", "Vatt", "Metr"], "correct": "B", "explanation": "Kuch birligi — Nyuton."},
         ],
     },
 ]
 
-# =========================
+# =========================================================
+# APP STATE
+# =========================================================
+
+recent_messages: Dict[int, List[float]] = defaultdict(list)
+user_filter_state: Dict[int, Dict[str, Any]] = defaultdict(dict)
+pending_contact: Dict[int, bool] = defaultdict(bool)
+
+# =========================================================
 # AI SERVICE
-# =========================
+# =========================================================
 
 class AIService:
     def __init__(self, settings: Settings):
         self.settings = settings
-
-    async def answer_text(self, prompt: str, context: str = "") -> str:
-        prompt = sanitize_text(prompt)
-        if not prompt:
-            return "Savolni yuboring, men bosqichma-bosqich tushuntiraman."
-
-        # 1) Math-first offline solving
-        math_result = self.solve_math(prompt)
-        if math_result:
-            return math_result
-
-        provider = self.detect_provider()
-        if provider == "openai":
-            result = await self._openai_text(prompt, context=context)
-            if result:
-                return result
-        elif provider == "gemini":
-            result = await self._gemini_text(prompt, context=context)
-            if result:
-                return result
-
-        return self._offline_teaching_answer(prompt)
 
     def detect_provider(self) -> str:
         if self.settings.AI_PROVIDER in {"openai", "gemini"}:
@@ -496,13 +435,11 @@ class AIService:
 
     def solve_math(self, text: str) -> Optional[str]:
         cleaned = text.lower().replace("=", " = ")
-        expr = None
         m = re.search(r"([0-9\.\+\-\*\/\(\)\s\^]+)", cleaned)
-        if m:
-            candidate = m.group(1).strip().replace("^", "**")
-            if re.fullmatch(r"[0-9\.\+\-\*\/\(\)\s\*]+", candidate):
-                expr = candidate
-        if not expr:
+        if not m:
+            return None
+        expr = m.group(1).strip().replace("^", "**")
+        if not re.fullmatch(r"[0-9\.\+\-\*\/\(\)\s\*]+", expr):
             return None
         try:
             node = ast.parse(expr, mode="eval")
@@ -540,7 +477,7 @@ class AIService:
                 return -operand
         raise ValueError("Unsupported expression")
 
-    def _offline_teaching_answer(self, prompt: str) -> str:
+    def offline_answer(self, prompt: str) -> str:
         return (
             "📘 <b>AI Ustoz</b>\n\n"
             f"<b>Savol:</b> {esc(prompt)}\n\n"
@@ -552,6 +489,27 @@ class AIService:
             "4) Hisoblang va tekshiring.\n\n"
             "Agar xohlasangiz, savolni aniqroq yozing yoki rasm/ovoz yuboring."
         )
+
+    async def answer_text(self, prompt: str, context: str = "") -> str:
+        prompt = sanitize_text(prompt)
+        if not prompt:
+            return "Savolni yuboring, men bosqichma-bosqich tushuntiraman."
+
+        math_result = self.solve_math(prompt)
+        if math_result:
+            return math_result
+
+        provider = self.detect_provider()
+        if provider == "openai":
+            result = await self._openai_text(prompt, context=context)
+            if result:
+                return result
+        elif provider == "gemini":
+            result = await self._gemini_text(prompt, context=context)
+            if result:
+                return result
+
+        return self.offline_answer(prompt)
 
     async def _openai_text(self, prompt: str, context: str = "") -> Optional[str]:
         if not self.settings.OPENAI_API_KEY:
@@ -576,7 +534,7 @@ class AIService:
                 data = r.json()
                 return data["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            logger.warning("OpenAI text fallback: %s", e)
+            logger.warning("OpenAI fallback: %s", e)
             return None
 
     async def _gemini_text(self, prompt: str, context: str = "") -> Optional[str]:
@@ -586,12 +544,7 @@ class AIService:
             model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.settings.GEMINI_API_KEY}"
             payload = {
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [{"text": f"{context}\n\nSavol: {prompt}".strip()}],
-                    }
-                ],
+                "contents": [{"role": "user", "parts": [{"text": f"{context}\n\nSavol: {prompt}".strip()}]}],
                 "generationConfig": {"temperature": 0.3},
             }
             async with httpx.AsyncClient(timeout=30) as client:
@@ -606,7 +559,7 @@ class AIService:
                 text = "".join(p.get("text", "") for p in parts).strip()
                 return text or None
         except Exception as e:
-            logger.warning("Gemini text fallback: %s", e)
+            logger.warning("Gemini fallback: %s", e)
             return None
 
     async def transcribe_voice(self, file_path: str) -> Optional[str]:
@@ -623,11 +576,10 @@ class AIService:
                         return None
                     return r.json().get("text")
         except Exception as e:
-            logger.warning("Voice transcription fallback: %s", e)
+            logger.warning("Voice fallback: %s", e)
             return None
 
     async def analyze_image(self, file_path: str, prompt: str = "") -> str:
-        # If OCR lib exists, try it; otherwise fallback to AI text
         ocr_text = None
         try:
             from PIL import Image  # type: ignore
@@ -667,11 +619,12 @@ class AIService:
             "Qulayroq natija uchun savolni matn ko‘rinishida yuboring."
         )
 
+
 ai_service = AIService(settings)
 
-# =========================
+# =========================================================
 # CERTIFICATES
-# =========================
+# =========================================================
 
 def generate_certificate_pdf(username: str, full_name: str, test_title: str, percent_value: int) -> Optional[str]:
     try:
@@ -705,13 +658,14 @@ def generate_certificate_pdf(username: str, full_name: str, test_title: str, per
     c.save()
     return str(file_path)
 
-# =========================
+# =========================================================
 # DB OPS
-# =========================
+# =========================================================
 
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
 
 async def seed_default_tests() -> None:
     async with SessionLocal() as session:
@@ -722,6 +676,7 @@ async def seed_default_tests() -> None:
             session.add(Test(**item))
         await session.commit()
 
+
 async def log_event(name: str, data: dict) -> None:
     try:
         async with SessionLocal() as session:
@@ -729,6 +684,7 @@ async def log_event(name: str, data: dict) -> None:
             await session.commit()
     except Exception as e:
         logger.warning("log_event failed: %s", e)
+
 
 async def log_message(telegram_id: int, direction: str, text: str) -> None:
     try:
@@ -738,6 +694,7 @@ async def log_message(telegram_id: int, direction: str, text: str) -> None:
     except Exception as e:
         logger.warning("log_message failed: %s", e)
 
+
 async def log_admin(admin_id: int, action: str, payload: dict) -> None:
     try:
         async with SessionLocal() as session:
@@ -745,6 +702,7 @@ async def log_admin(admin_id: int, action: str, payload: dict) -> None:
             await session.commit()
     except Exception as e:
         logger.warning("log_admin failed: %s", e)
+
 
 async def ensure_user(session: AsyncSession, tg_user: types.User) -> User:
     q = await session.execute(select(User).where(User.telegram_id == tg_user.id))
@@ -767,23 +725,26 @@ async def ensure_user(session: AsyncSession, tg_user: types.User) -> User:
     await session.commit()
     return user
 
+
 async def get_user_by_tg(session: AsyncSession, telegram_id: int) -> Optional[User]:
     q = await session.execute(select(User).where(User.telegram_id == telegram_id))
     return q.scalar_one_or_none()
+
 
 async def get_test_by_code(session: AsyncSession, code: str) -> Optional[Test]:
     q = await session.execute(select(Test).where(func.upper(Test.code) == code.upper()))
     return q.scalar_one_or_none()
 
+
 async def get_test_by_id(session: AsyncSession, test_id: int) -> Optional[Test]:
     q = await session.execute(select(Test).where(Test.id == test_id))
     return q.scalar_one_or_none()
 
+
 async def user_already_solved(session: AsyncSession, user_id: int, test_id: int) -> bool:
-    q = await session.execute(
-        select(Result.id).where(and_(Result.user_id == user_id, Result.test_id == test_id))
-    )
+    q = await session.execute(select(Result.id).where(and_(Result.user_id == user_id, Result.test_id == test_id)))
     return q.scalar_one_or_none() is not None
+
 
 async def update_streak(session: AsyncSession, user_id: int) -> Tuple[int, int]:
     q = await session.execute(select(Streak).where(Streak.user_id == user_id))
@@ -806,14 +767,14 @@ async def update_streak(session: AsyncSession, user_id: int) -> Tuple[int, int]:
     await session.commit()
     return streak.current, streak.best
 
+
 def compute_mistakes(answer_key: list, raw_answers: list) -> Tuple[int, int, list]:
     correct = 0
     mistakes: list = []
     for idx, item in enumerate(answer_key):
         expected = str(item.get("correct", "")).upper().strip()
         got = str(raw_answers[idx]).upper().strip() if idx < len(raw_answers) else ""
-        is_correct = got == expected
-        if is_correct:
+        if got == expected:
             correct += 1
         else:
             mistakes.append(
@@ -828,8 +789,9 @@ def compute_mistakes(answer_key: list, raw_answers: list) -> Tuple[int, int, lis
     wrong = len(answer_key) - correct
     return correct, wrong, mistakes
 
+
 def make_result_text(test: Test, result: Result) -> str:
-    level, current_xp, need = level_from_xp(result.score)
+    level, _, need = level_from_xp(result.score)
     mistake_text = "\n".join(
         [
             f"{i+1}) <b>{esc(m['question'])}</b>\n"
@@ -853,13 +815,14 @@ def make_result_text(test: Test, result: Result) -> str:
         f"<b>Xato savollar:</b>\n{mistake_text}"
     )
 
-def daily_test_index() -> int:
-    today = date.today().toordinal()
-    return today
 
-# =========================
-# KEYBOARDS / UI
-# =========================
+def daily_test_index() -> int:
+    return date.today().toordinal()
+
+# =========================================================
+# KEYBOARDS
+# =========================================================
+
 
 def kb_main(is_admin: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
@@ -876,12 +839,14 @@ def kb_main(is_admin: bool = False) -> InlineKeyboardMarkup:
     b.adjust(2, 2, 2, 2, 1)
     return b.as_markup()
 
+
 def kb_back_home(back: str = "nav:home") -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="⬅️ Orqaga", callback_data=back)
     b.button(text="🏠 Bosh menyu", callback_data="nav:home")
     b.adjust(2)
     return b.as_markup()
+
 
 def kb_tests_page(tests: List[Test], page: int, total_pages: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
@@ -897,10 +862,10 @@ def kb_tests_page(tests: List[Test], page: int, total_pages: int) -> InlineKeybo
     b.attach(nav)
     b.button(text="🔎 Qidirish", callback_data="tests:search")
     b.button(text="🎚 Filter", callback_data="tests:filter")
-    b.button(text="⭐ Favorites", callback_data="menu:favorites")
     b.button(text="🏠 Bosh menyu", callback_data="nav:home")
-    b.adjust(1, 1, 1, 1, 1, 1, 2)
+    b.adjust(1, 1, 1, 1, 1)
     return b.as_markup()
+
 
 def kb_test_detail(test: Test, is_fav: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
@@ -914,12 +879,6 @@ def kb_test_detail(test: Test, is_fav: bool = False) -> InlineKeyboardMarkup:
     b.adjust(1, 1, 1, 1, 2)
     return b.as_markup()
 
-def kb_yes_no_yes(text_yes: str, yes_cb: str, text_no: str, no_cb: str) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text=text_yes, callback_data=yes_cb)
-    b.button(text=text_no, callback_data=no_cb)
-    b.adjust(2)
-    return b.as_markup()
 
 def kb_admin() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
@@ -933,43 +892,41 @@ def kb_admin() -> InlineKeyboardMarkup:
     b.adjust(2, 2, 2, 1)
     return b.as_markup()
 
-def kb_simple_back_home(back_cb: str = "nav:home") -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="⬅️ Orqaga", callback_data=back_cb)
-    b.button(text="🏠 Bosh menyu", callback_data="nav:home")
-    b.adjust(2)
-    return b.as_markup()
-
-# =========================
+# =========================================================
 # STATES
-# =========================
+# =========================================================
 
 class AddTestState(StatesGroup):
     waiting_json = State()
 
+
 class DeleteTestState(StatesGroup):
     waiting_code = State()
+
 
 class BroadcastState(StatesGroup):
     waiting_text = State()
 
+
 class SearchState(StatesGroup):
     waiting_query = State()
 
+
 class ContactState(StatesGroup):
     waiting_message = State()
+
 
 class SubmitState(StatesGroup):
     waiting_code = State()
     waiting_answers = State()
 
+
 class AIState(StatesGroup):
     waiting_question = State()
-    waiting_image_caption = State()
 
-# =========================
+# =========================================================
 # MIDDLEWARES
-# =========================
+# =========================================================
 
 class RateLimitMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -990,41 +947,34 @@ class RateLimitMiddleware(BaseMiddleware):
             bucket.append(now)
         return await handler(event, data)
 
+
 class SafeErrorMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         try:
             return await handler(event, data)
         except Exception as e:
             logger.exception("Handler error: %s", e)
-            if isinstance(event, Message):
-                try:
-                    await event.answer("⚠️ Kutilmagan xatolik yuz berdi. Amaliyot to‘xtadi, lekin bot ishlashda davom etadi.")
-                except Exception:
-                    pass
-            elif isinstance(event, CallbackQuery):
-                try:
+            try:
+                if isinstance(event, Message):
+                    await event.answer("⚠️ Kutilmagan xatolik yuz berdi. Bot ishlashda davom etadi.")
+                elif isinstance(event, CallbackQuery):
                     await event.answer("⚠️ Xatolik yuz berdi.", show_alert=False)
-                except Exception:
-                    pass
+            except Exception:
+                pass
             return None
 
-# =========================
+# =========================================================
 # GLOBALS
-# =========================
+# =========================================================
 
 router = Router()
 bot: Optional[Bot] = None
 dp: Optional[Dispatcher] = None
 polling_task: Optional[asyncio.Task] = None
 
-app = FastAPI(title=settings.APP_NAME, version="2.0.0")
-
-# =========================
-# END PART 1
-# =========================
-# =========================
-# PART 2 / 2
-# =========================
+# =========================================================
+# TELEGRAM HANDLERS
+# =========================================================
 
 async def load_tests(session: AsyncSession, page: int = 1, query: str = "", category: str = "", difficulty: str = "") -> Tuple[List[Test], int]:
     stmt = select(Test).where(Test.active == True)  # noqa: E712
@@ -1044,21 +994,20 @@ async def load_tests(session: AsyncSession, page: int = 1, query: str = "", cate
     end = start + settings.MAX_TESTS_PER_PAGE
     return items[start:end], total_pages
 
+
 async def get_favorite_test_ids(session: AsyncSession, user_id: int) -> set[int]:
     q = await session.execute(select(Favorite.test_id).where(Favorite.user_id == user_id))
     return {x for x in q.scalars().all()}
 
+
 async def get_user_stats(session: AsyncSession, user_id: int) -> dict:
-    user = (await session.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-    if not user:
-        return {}
     results = list((await session.execute(select(Result).where(Result.user_id == user_id))).scalars().all())
     avg = round(sum(r.percent_value for r in results) / len(results), 1) if results else 0.0
     best = max([r.percent_value for r in results], default=0)
     return {"avg": avg, "best": best, "count": len(results)}
 
+
 async def get_leaderboard(session: AsyncSession, mode: str = "all") -> List[Tuple[User, int]]:
-    # Returns users ordered by score proxy
     stmt = select(User, func.coalesce(func.sum(Result.score), 0).label("score_sum")).outerjoin(
         Result, Result.user_id == User.id
     )
@@ -1071,6 +1020,7 @@ async def get_leaderboard(session: AsyncSession, mode: str = "all") -> List[Tupl
     stmt = stmt.group_by(User.id).order_by(func.coalesce(func.sum(Result.score), 0).desc(), User.xp.desc())
     rows = (await session.execute(stmt)).all()
     return [(row[0], int(row[1] or 0)) for row in rows]
+
 
 async def render_tests_page(user_id: int, page: int = 1) -> Tuple[str, InlineKeyboardMarkup]:
     state = user_filter_state[user_id]
@@ -1085,12 +1035,12 @@ async def render_tests_page(user_id: int, page: int = 1) -> Tuple[str, InlineKey
             f"<b>Qidiruv:</b> {esc(query or '—')}",
             f"<b>Filter:</b> {esc(category or '—')} | {esc(difficulty or '—')}",
             "",
-            "Testni tanlang:"
+            "Testni tanlang:",
         ]
         if not tests:
             lines.append("\nHech narsa topilmadi.")
-        text = "\n".join(lines)
-        return text, kb_tests_page(tests, page, total_pages)
+        return "\n".join(lines), kb_tests_page(tests, page, total_pages)
+
 
 def build_profile_text(user: User, stats: dict) -> str:
     lvl, current, need = level_from_xp(user.xp)
@@ -1111,9 +1061,9 @@ def build_profile_text(user: User, stats: dict) -> str:
         f"<b>Level progress:</b> {progress}%\n"
     )
 
+
 async def refresh_user_metrics(session: AsyncSession, user: User) -> None:
-    q = await session.execute(select(Result).where(Result.user_id == user.id))
-    results = list(q.scalars().all())
+    results = list((await session.execute(select(Result).where(Result.user_id == user.id))).scalars().all())
     if results:
         user.avg_percent = round(sum(r.percent_value for r in results) / len(results), 1)
         user.best_percent = max(r.percent_value for r in results)
@@ -1123,6 +1073,7 @@ async def refresh_user_metrics(session: AsyncSession, user: User) -> None:
     user.level, _, _ = level_from_xp(user.xp)
     user.badge = badge_from_level(user.level)
     await session.commit()
+
 
 async def save_result(
     session: AsyncSession,
@@ -1157,6 +1108,7 @@ async def save_result(
     await session.commit()
     return res
 
+
 def build_review_text(test: Test, result: Result) -> str:
     parts = [
         f"📘 <b>Review mode</b>\n\n<b>{esc(test.code)} — {esc(test.title)}</b>",
@@ -1166,10 +1118,9 @@ def build_review_text(test: Test, result: Result) -> str:
     for idx, item in enumerate(test.answer_key, start=1):
         parts.append(f"<b>{idx}) {esc(item.get('question',''))}</b>")
         opts = item.get("options", [])
-        if opts:
-            for oi, opt in enumerate(opts):
-                letter = chr(65 + oi)
-                parts.append(f"   {letter}. {esc(opt)}")
+        for oi, opt in enumerate(opts):
+            letter = chr(65 + oi)
+            parts.append(f"   {letter}. {esc(opt)}")
         parts.append(f"   To‘g‘ri javob: <code>{esc(item.get('correct',''))}</code>")
         if result.raw_answers and idx - 1 < len(result.raw_answers):
             parts.append(f"   Sizning javobingiz: <code>{esc(result.raw_answers[idx-1])}</code>")
@@ -1178,7 +1129,8 @@ def build_review_text(test: Test, result: Result) -> str:
         parts.append("")
     return "\n".join(parts)
 
-async def send_main_menu(target: Message | CallbackQuery, user: User, session: Optional[AsyncSession] = None) -> None:
+
+async def send_main_menu(target: Message | CallbackQuery, user: User) -> None:
     is_admin = user.telegram_id in settings.admin_ids
     text = (
         "🏠 <b>Bosh menyu</b>\n\n"
@@ -1190,6 +1142,7 @@ async def send_main_menu(target: Message | CallbackQuery, user: User, session: O
         await target.answer(text, reply_markup=markup)
     else:
         await target.message.edit_text(text, reply_markup=markup)
+
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
@@ -1206,6 +1159,7 @@ async def cmd_start(message: Message):
         reply_markup=kb_main(is_admin=message.from_user.id in settings.admin_ids),
     )
 
+
 @router.message(Command("menu"))
 async def cmd_menu(message: Message):
     if not message.from_user:
@@ -1213,6 +1167,7 @@ async def cmd_menu(message: Message):
     async with SessionLocal() as session:
         user = await ensure_user(session, message.from_user)
     await send_main_menu(message, user)
+
 
 @router.callback_query(F.data == "nav:home")
 async def nav_home(callback: CallbackQuery):
@@ -1226,9 +1181,11 @@ async def nav_home(callback: CallbackQuery):
         reply_markup=kb_main(is_admin=callback.from_user.id in settings.admin_ids),
     )
 
+
 @router.callback_query(F.data == "noop")
 async def noop(callback: CallbackQuery):
     await callback.answer()
+
 
 @router.callback_query(F.data == "menu:tests")
 async def menu_tests(callback: CallbackQuery):
@@ -1240,6 +1197,7 @@ async def menu_tests(callback: CallbackQuery):
     text, markup = await render_tests_page(user.telegram_id, 1)
     await callback.message.edit_text(text, reply_markup=markup)
 
+
 @router.callback_query(F.data.startswith("tests:page:"))
 async def tests_page(callback: CallbackQuery):
     if not callback.from_user:
@@ -1250,15 +1208,16 @@ async def tests_page(callback: CallbackQuery):
     text, markup = await render_tests_page(user.telegram_id, page)
     await callback.message.edit_text(text, reply_markup=markup)
 
+
 @router.callback_query(F.data == "tests:search")
 async def tests_search(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    pending_admin_action[callback.from_user.id] = ""
     await state.set_state(SearchState.waiting_query)
     await callback.message.edit_text(
         "🔎 Qidiruv so‘zini yuboring.\n\nMasalan: algebra, fizika, MATH-001",
         reply_markup=kb_back_home("menu:tests"),
     )
+
 
 @router.message(StateFilter(SearchState.waiting_query))
 async def tests_search_input(message: Message, state: FSMContext):
@@ -1266,13 +1225,12 @@ async def tests_search_input(message: Message, state: FSMContext):
         return
     q = sanitize_text(message.text or "")
     user_filter_state[message.from_user.id]["query"] = q
-    user_filter_state[message.from_user.id]["category"] = user_filter_state[message.from_user.id].get("category", "")
-    user_filter_state[message.from_user.id]["difficulty"] = user_filter_state[message.from_user.id].get("difficulty", "")
     await state.clear()
     async with SessionLocal() as session:
         user = await ensure_user(session, message.from_user)
     text, markup = await render_tests_page(user.telegram_id, 1)
     await message.answer(text, reply_markup=markup)
+
 
 @router.callback_query(F.data == "tests:filter")
 async def tests_filter(callback: CallbackQuery):
@@ -1287,6 +1245,7 @@ async def tests_filter(callback: CallbackQuery):
     b.adjust(2, 2, 1, 1)
     await callback.message.edit_text("🎚 Filter tanlang:", reply_markup=b.as_markup())
 
+
 @router.callback_query(F.data.startswith("tests:cat:"))
 async def tests_filter_cat(callback: CallbackQuery):
     cat = callback.data.split("tests:cat:", 1)[1]
@@ -1296,6 +1255,7 @@ async def tests_filter_cat(callback: CallbackQuery):
         user = await ensure_user(session, callback.from_user)
     text, markup = await render_tests_page(user.telegram_id, 1)
     await callback.message.edit_text(text, reply_markup=markup)
+
 
 @router.callback_query(F.data.startswith("tests:diff:"))
 async def tests_filter_diff(callback: CallbackQuery):
@@ -1307,6 +1267,7 @@ async def tests_filter_diff(callback: CallbackQuery):
     text, markup = await render_tests_page(user.telegram_id, 1)
     await callback.message.edit_text(text, reply_markup=markup)
 
+
 @router.callback_query(F.data == "tests:clear_filter")
 async def tests_clear_filter(callback: CallbackQuery):
     user_filter_state[callback.from_user.id] = {}
@@ -1315,6 +1276,7 @@ async def tests_clear_filter(callback: CallbackQuery):
         user = await ensure_user(session, callback.from_user)
     text, markup = await render_tests_page(user.telegram_id, 1)
     await callback.message.edit_text(text, reply_markup=markup)
+
 
 @router.callback_query(F.data.startswith("test:open:"))
 async def test_open(callback: CallbackQuery):
@@ -1335,10 +1297,11 @@ async def test_open(callback: CallbackQuery):
             f"<b>Mavzu:</b> {esc(test.topic)}\n"
             f"<b>Qiyinlik:</b> {esc(test.difficulty)}\n"
             f"<b>Sana:</b> {iso(test.created_at)}\n\n"
-            f"{esc(test.preview_text or 'Preview mavjud emas.')}"
+            f"{esc(test.preview_text or 'Preview mavjud emas.') }"
         )
         await callback.answer()
         await callback.message.edit_text(text, reply_markup=kb_test_detail(test, is_fav=test.id in fav_ids))
+
 
 @router.callback_query(F.data.startswith("fav:toggle:"))
 async def fav_toggle(callback: CallbackQuery):
@@ -1363,6 +1326,7 @@ async def fav_toggle(callback: CallbackQuery):
         fav_ids = await get_favorite_test_ids(session, user.id)
         await callback.message.edit_reply_markup(reply_markup=kb_test_detail(test, is_fav=test.id in fav_ids))
 
+
 @router.callback_query(F.data.startswith("test:submit:"))
 async def submit_test_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -1381,6 +1345,7 @@ async def submit_test_start(callback: CallbackQuery, state: FSMContext):
             "Yoki faqat kod yuboring, keyin javoblarni alohida so‘rayman.",
             reply_markup=kb_back_home(f"test:open:{test_id}"),
         )
+
 
 @router.message(StateFilter(SubmitState.waiting_code))
 async def submit_code_input(message: Message, state: FSMContext):
@@ -1419,6 +1384,7 @@ async def submit_code_input(message: Message, state: FSMContext):
                 reply_markup=kb_back_home("menu:tests"),
             )
 
+
 @router.message(StateFilter(SubmitState.waiting_answers))
 async def submit_answers_input(message: Message, state: FSMContext):
     if not message.from_user:
@@ -1437,15 +1403,12 @@ async def submit_answers_input(message: Message, state: FSMContext):
             await message.answer("Bu test allaqachon ishlangan.", reply_markup=kb_back_home("menu:tests"))
             await state.clear()
             return
-
         raw_answers = parse_answers(raw_answers_text)
         if not raw_answers:
             await message.answer("Javob formatini to‘g‘ri yuboring: <code>A B C</code>", reply_markup=kb_back_home("menu:tests"))
             return
-
         correct_count, wrong_count, mistakes = compute_mistakes(test.answer_key, raw_answers)
-        duration_sec = safe_int(data.get("duration_sec", 0), 0)
-        result = await save_result(session, user, test, correct_count, wrong_count, duration_sec, raw_answers, mistakes)
+        result = await save_result(session, user, test, correct_count, wrong_count, 0, raw_answers, mistakes)
         await log_event("test_completed", {"user_id": user.telegram_id, "test_id": test.id, "percent": result.percent_value})
         await log_message(user.telegram_id, "in", message.text or "")
         await state.clear()
@@ -1470,6 +1433,7 @@ async def submit_answers_input(message: Message, state: FSMContext):
                     caption=f"🎓 Sertifikat tayyor: {test.title} — {result.percent_value}%",
                 )
 
+
 @router.callback_query(F.data.startswith("test:review:"))
 async def test_review(callback: CallbackQuery):
     if not callback.from_user:
@@ -1481,19 +1445,13 @@ async def test_review(callback: CallbackQuery):
         if not test:
             await callback.answer("Topilmadi", show_alert=True)
             return
-        result = (
-            await session.execute(
-                select(Result).where(and_(Result.user_id == user.id, Result.test_id == test.id))
-            )
-        ).scalar_one_or_none()
+        result = (await session.execute(select(Result).where(and_(Result.user_id == user.id, Result.test_id == test.id)))).scalar_one_or_none()
         if not result:
             await callback.answer("Avval testni ishlang", show_alert=True)
             return
         await callback.answer()
-        await callback.message.edit_text(
-            build_review_text(test, result),
-            reply_markup=kb_back_home(f"test:open:{test.id}"),
-        )
+        await callback.message.edit_text(build_review_text(test, result), reply_markup=kb_back_home(f"test:open:{test.id}"))
+
 
 @router.callback_query(F.data == "menu:results")
 async def menu_results(callback: CallbackQuery):
@@ -1502,25 +1460,21 @@ async def menu_results(callback: CallbackQuery):
     await callback.answer()
     async with SessionLocal() as session:
         user = await ensure_user(session, callback.from_user)
-        q = await session.execute(
-            select(Result, Test).join(Test, Test.id == Result.test_id).where(Result.user_id == user.id).order_by(Result.created_at.desc()).limit(10)
-        )
+        q = await session.execute(select(Result, Test).join(Test, Test.id == Result.test_id).where(Result.user_id == user.id).order_by(Result.created_at.desc()).limit(10))
         rows = q.all()
         if not rows:
             await callback.message.edit_text("📈 <b>Natijalarim</b>\n\nHozircha natija yo‘q.", reply_markup=kb_back_home())
             return
         text = ["📈 <b>Natijalarim</b>\n"]
         for r, t in rows:
-            text.append(
-                f"• <b>{esc(t.code)}</b> — {r.percent_value}% | "
-                f"{r.correct_count}/{len(t.answer_key)} | ball {r.score}"
-            )
+            text.append(f"• <b>{esc(t.code)}</b> — {r.percent_value}% | {r.correct_count}/{len(t.answer_key)} | ball {r.score}")
         stats = await get_user_stats(session, user.id)
         text.append("")
         text.append(f"<b>O‘rtacha:</b> {stats.get('avg', 0)}%")
         text.append(f"<b>Eng yaxshi:</b> {stats.get('best', 0)}%")
         text.append(f"<b>Oxirgi:</b> {rows[0][0].percent_value}%")
         await callback.message.edit_text("\n".join(text), reply_markup=kb_back_home())
+
 
 @router.callback_query(F.data == "menu:profile")
 async def menu_profile(callback: CallbackQuery):
@@ -1533,6 +1487,7 @@ async def menu_profile(callback: CallbackQuery):
         text = build_profile_text(user, stats)
     await callback.message.edit_text(text, reply_markup=kb_back_home())
 
+
 @router.callback_query(F.data == "menu:favorites")
 async def menu_favorites(callback: CallbackQuery):
     if not callback.from_user:
@@ -1540,9 +1495,7 @@ async def menu_favorites(callback: CallbackQuery):
     await callback.answer()
     async with SessionLocal() as session:
         user = await ensure_user(session, callback.from_user)
-        q = await session.execute(
-            select(Test).join(Favorite, Favorite.test_id == Test.id).where(Favorite.user_id == user.id).order_by(Favorite.created_at.desc())
-        )
+        q = await session.execute(select(Test).join(Favorite, Favorite.test_id == Test.id).where(Favorite.user_id == user.id).order_by(Favorite.created_at.desc()))
         tests = list(q.scalars().all())
         if not tests:
             await callback.message.edit_text("⭐ Favorites bo‘sh.", reply_markup=kb_back_home())
@@ -1553,6 +1506,7 @@ async def menu_favorites(callback: CallbackQuery):
         b.button(text="⬅️ Orqaga", callback_data="nav:home")
         b.adjust(1)
         await callback.message.edit_text("⭐ <b>Favorites</b>", reply_markup=b.as_markup())
+
 
 @router.callback_query(F.data == "menu:daily")
 async def menu_daily(callback: CallbackQuery):
@@ -1568,11 +1522,10 @@ async def menu_daily(callback: CallbackQuery):
         idx = daily_test_index() % len(tests)
         test = tests[idx]
         await callback.message.edit_text(
-            f"🎯 <b>Daily challenge</b>\n\n"
-            f"Bugungi test: <b>{esc(test.code)}</b> — {esc(test.title)}\n"
-            f"Qiyinlik: {esc(test.difficulty)}",
+            f"🎯 <b>Daily challenge</b>\n\nBugungi test: <b>{esc(test.code)}</b> — {esc(test.title)}\nQiyinlik: {esc(test.difficulty)}",
             reply_markup=kb_test_detail(test),
         )
+
 
 @router.callback_query(F.data == "menu:leaderboard")
 async def menu_leaderboard(callback: CallbackQuery):
@@ -1586,6 +1539,7 @@ async def menu_leaderboard(callback: CallbackQuery):
     b.button(text="⬅️ Orqaga", callback_data="nav:home")
     b.adjust(3, 1)
     await callback.message.edit_text("🏆 Reyting turini tanlang:", reply_markup=b.as_markup())
+
 
 @router.callback_query(F.data.startswith("leaderboard:"))
 async def leaderboard_view(callback: CallbackQuery):
@@ -1603,6 +1557,7 @@ async def leaderboard_view(callback: CallbackQuery):
                 lines.append(f"{idx}. {esc(user.full_name or user.username or 'User')} — XP: {user.xp} | score: {score_sum}")
         await callback.message.edit_text("\n".join(lines), reply_markup=kb_back_home())
 
+
 @router.callback_query(F.data == "menu:contact")
 async def menu_contact(callback: CallbackQuery, state: FSMContext):
     if not callback.from_user:
@@ -1614,6 +1569,7 @@ async def menu_contact(callback: CallbackQuery, state: FSMContext):
         "✉️ Adminga xabar yuboring.\n\nXabar matnini yozing, men uni admin panelga yuboraman.",
         reply_markup=kb_back_home(),
     )
+
 
 @router.message(StateFilter(ContactState.waiting_message))
 async def contact_message(message: Message, state: FSMContext):
@@ -1629,26 +1585,23 @@ async def contact_message(message: Message, state: FSMContext):
         try:
             await bot.send_message(
                 admin_id,
-                f"✉️ <b>Yangi xabar</b>\n\n"
-                f"<b>From:</b> {esc(user.full_name)}\n"
-                f"<b>User ID:</b> <code>{user.telegram_id}</code>\n"
-                f"<b>Username:</b> @{esc(user.username) if user.username else '-'}\n\n"
-                f"{esc(text)}"
+                f"✉️ <b>Yangi xabar</b>\n\n<b>From:</b> {esc(user.full_name)}\n<b>User ID:</b> <code>{user.telegram_id}</code>\n<b>Username:</b> @{esc(user.username) if user.username else '-'}\n\n{esc(text)}",
             )
         except Exception as e:
             logger.warning("contact forward failed: %s", e)
     await state.clear()
     await message.answer("✅ Xabar adminga yuborildi.", reply_markup=kb_back_home())
 
+
 @router.callback_query(F.data == "menu:ai")
 async def menu_ai(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(AIState.waiting_question)
     await callback.message.edit_text(
-        "🧠 <b>AI Ustoz</b>\n\nSavolingizni matn ko‘rinishida yuboring.\n"
-        "Rasm yoki ovoz yuborsangiz ham urunib ko‘raman.",
+        "🧠 <b>AI Ustoz</b>\n\nSavolingizni matn ko‘rinishida yuboring.\nRasm yoki ovoz yuborsangiz ham urunib ko‘raman.",
         reply_markup=kb_back_home(),
     )
+
 
 @router.message(StateFilter(AIState.waiting_question), F.photo)
 async def ai_photo(message: Message, state: FSMContext):
@@ -1662,6 +1615,7 @@ async def ai_photo(message: Message, state: FSMContext):
     result = await ai_service.analyze_image(path, prompt=caption)
     await message.answer(result, reply_markup=kb_back_home())
     await state.clear()
+
 
 @router.message(StateFilter(AIState.waiting_question), F.voice)
 async def ai_voice(message: Message, state: FSMContext):
@@ -1679,6 +1633,7 @@ async def ai_voice(message: Message, state: FSMContext):
     await message.answer(f"🎙 <b>Transcription</b>\n\n{esc(text)}\n\n{result}", reply_markup=kb_back_home())
     await state.clear()
 
+
 @router.message(StateFilter(AIState.waiting_question))
 async def ai_text(message: Message, state: FSMContext):
     if not message.from_user:
@@ -1690,6 +1645,7 @@ async def ai_text(message: Message, state: FSMContext):
     result = await ai_service.answer_text(text)
     await message.answer(result, reply_markup=kb_back_home())
 
+
 @router.callback_query(F.data == "menu:admin")
 async def admin_menu(callback: CallbackQuery):
     if not callback.from_user or callback.from_user.id not in settings.admin_ids:
@@ -1697,6 +1653,7 @@ async def admin_menu(callback: CallbackQuery):
         return
     await callback.answer()
     await callback.message.edit_text("🛠 <b>Admin panel</b>", reply_markup=kb_admin())
+
 
 @router.callback_query(F.data == "admin:add_test")
 async def admin_add_test(callback: CallbackQuery, state: FSMContext):
@@ -1706,21 +1663,10 @@ async def admin_add_test(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(AddTestState.waiting_json)
     await callback.message.edit_text(
-        "➕ <b>Test qo‘shish</b>\n\n"
-        "Testni JSON formatda yuboring.\n\n"
-        "<code>{"
-        '"code":"MATH-002",'
-        '"title":"...",'
-        '"category":"Matematika",'
-        '"topic":"Algebra",'
-        '"difficulty":"O‘rta",'
-        '"pdf_url":"",'
-        '"preview_text":"...",'
-        '"max_score":20,'
-        '"answer_key":[{"question":"...","options":["A","B","C","D"],"correct":"B","explanation":"..."}]'
-        "}</code>",
+        "➕ <b>Test qo‘shish</b>\n\nTestni JSON formatda yuboring.\n\n<code>{\"code\":\"MATH-002\",\"title\":\"...\",\"category\":\"Matematika\",\"topic\":\"Algebra\",\"difficulty\":\"O‘rta\",\"pdf_url\":\"\",\"preview_text\":\"...\",\"max_score\":20,\"answer_key\":[{\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"correct\":\"B\",\"explanation\":\"...\"}]}</code>",
         reply_markup=kb_back_home("menu:admin"),
     )
+
 
 @router.message(StateFilter(AddTestState.waiting_json))
 async def admin_add_test_input(message: Message, state: FSMContext):
@@ -1729,8 +1675,7 @@ async def admin_add_test_input(message: Message, state: FSMContext):
     raw = message.text or ""
     try:
         data = json.loads(raw)
-        required = ["code", "title", "answer_key"]
-        for key in required:
+        for key in ["code", "title", "answer_key"]:
             if key not in data:
                 raise ValueError(f"{key} missing")
         async with SessionLocal() as session:
@@ -1759,6 +1704,7 @@ async def admin_add_test_input(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"⚠️ JSON noto‘g‘ri.\n\n{esc(str(e))}", reply_markup=kb_back_home("menu:admin"))
 
+
 @router.callback_query(F.data == "admin:delete_test")
 async def admin_delete_test(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in settings.admin_ids:
@@ -1767,11 +1713,10 @@ async def admin_delete_test(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(DeleteTestState.waiting_code)
     await callback.message.edit_text(
-        "🗑 <b>Test o‘chirish</b>\n\n"
-        "Test kodini yuboring.\n"
-        "Masalan: <code>MATH-001</code>",
+        "🗑 <b>Test o‘chirish</b>\n\nTest kodini yuboring.\nMasalan: <code>MATH-001</code>",
         reply_markup=kb_back_home("menu:admin"),
     )
+
 
 @router.message(StateFilter(DeleteTestState.waiting_code))
 async def admin_delete_test_input(message: Message, state: FSMContext):
@@ -1789,6 +1734,7 @@ async def admin_delete_test_input(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ Test o‘chirildi.", reply_markup=kb_back_home("menu:admin"))
 
+
 @router.callback_query(F.data == "admin:broadcast")
 async def admin_broadcast(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in settings.admin_ids:
@@ -1797,10 +1743,10 @@ async def admin_broadcast(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(BroadcastState.waiting_text)
     await callback.message.edit_text(
-        "📣 Ommaviy xabar matnini yuboring.\n\n"
-        "Xabar barcha foydalanuvchilarga yuboriladi.",
+        "📣 Ommaviy xabar matnini yuboring.\n\nXabar barcha foydalanuvchilarga yuboriladi.",
         reply_markup=kb_back_home("menu:admin"),
     )
+
 
 @router.message(StateFilter(BroadcastState.waiting_text))
 async def admin_broadcast_input(message: Message, state: FSMContext):
@@ -1822,6 +1768,7 @@ async def admin_broadcast_input(message: Message, state: FSMContext):
     await log_admin(message.from_user.id, "broadcast", {"sent": ok})
     await state.clear()
     await message.answer(f"✅ Yuborildi: {ok} ta user.", reply_markup=kb_back_home("menu:admin"))
+
 
 @router.callback_query(F.data == "admin:stats")
 async def admin_stats(callback: CallbackQuery):
@@ -1853,6 +1800,7 @@ async def admin_stats(callback: CallbackQuery):
         )
     await callback.message.edit_text(text, reply_markup=kb_back_home("menu:admin"))
 
+
 @router.callback_query(F.data == "admin:top")
 async def admin_top(callback: CallbackQuery):
     if callback.from_user.id not in settings.admin_ids:
@@ -1865,6 +1813,7 @@ async def admin_top(callback: CallbackQuery):
         for idx, (user, score_sum) in enumerate(rows[:10], start=1):
             text += f"{idx}. {esc(user.full_name or user.username or 'User')} — XP: {user.xp} | score: {score_sum}\n"
     await callback.message.edit_text(text, reply_markup=kb_back_home("menu:admin"))
+
 
 @router.callback_query(F.data == "admin:logs")
 async def admin_logs(callback: CallbackQuery):
@@ -1882,6 +1831,7 @@ async def admin_logs(callback: CallbackQuery):
                 text += f"• {iso(r.created_at)} — {esc(r.action)}\n"
     await callback.message.edit_text(text, reply_markup=kb_back_home("menu:admin"))
 
+
 @router.message()
 async def catch_all(message: Message):
     if not message.from_user:
@@ -1895,9 +1845,9 @@ async def catch_all(message: Message):
         reply_markup=kb_main(is_admin=message.from_user.id in settings.admin_ids),
     )
 
-# =========================
-# WEBHOOK / FASTAPI
-# =========================
+# =========================================================
+# FASTAPI + WEBHOOK
+# =========================================================
 
 @app.get("/health")
 async def health():
@@ -1907,16 +1857,17 @@ async def health():
             "app": settings.APP_NAME,
             "env": settings.APP_ENV,
             "bot_token": bool(settings.BOT_TOKEN),
-            "database": settings.DATABASE_URL.split("@")[-1] if "@" in settings.DATABASE_URL else "configured",
             "webhook": bool(settings.WEBHOOK_URL),
         }
     )
+
 
 @app.get("/")
 async def root():
     return PlainTextResponse("math_tekshiruvchi_bot is running")
 
-@app.post(settings.WEBHOOK_PATH)
+
+@app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     global bot, dp
     if not bot or not dp:
@@ -1930,9 +1881,9 @@ async def telegram_webhook(request: Request):
     await dp.feed_update(bot, update)
     return JSONResponse({"ok": True})
 
-# =========================
-# STARTUP / SHUTDOWN
-# =========================
+# =========================================================
+# LIFESPAN
+# =========================================================
 
 async def setup_bot() -> None:
     global bot, dp
@@ -1940,7 +1891,10 @@ async def setup_bot() -> None:
         logger.warning("BOT_TOKEN not set. Bot will not start, but web server will stay alive.")
         return
 
-    bot = Bot(token=settings.BOT_TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(
+        token=settings.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(RateLimitMiddleware())
     dp.update.middleware(SafeErrorMiddleware())
@@ -1957,6 +1911,7 @@ async def setup_bot() -> None:
     else:
         logger.info("Polling fallback mode will be used.")
 
+
 async def start_polling_background() -> None:
     global bot, dp
     if not bot or not dp:
@@ -1966,20 +1921,21 @@ async def start_polling_background() -> None:
     except Exception as e:
         logger.exception("Polling crashed: %s", e)
 
-@app.on_event("startup")
-async def on_startup():
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     await init_db()
     await seed_default_tests()
     await setup_bot()
-    if settings.BOT_TOKEN and not settings.WEBHOOK_URL:
-        # polling fallback
-        global polling_task
+
+    global polling_task
+    if settings.BOT_TOKEN and not settings.WEBHOOK_URL and dp and bot:
         polling_task = asyncio.create_task(start_polling_background())
         logger.info("Polling task started.")
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    global bot, polling_task
+    yield
+
+    global bot
     if polling_task and not polling_task.done():
         polling_task.cancel()
     if bot and settings.WEBHOOK_URL:
@@ -1990,13 +1946,14 @@ async def on_shutdown():
     if bot:
         await bot.session.close()
 
-# =========================
+
+app = FastAPI(title=settings.APP_NAME, version="3.0.0", lifespan=lifespan)
+
+# =========================================================
 # MAIN
-# =========================
+# =========================================================
 
 if __name__ == "__main__":
-    if not settings.BOT_TOKEN:
-        logger.warning("BOT_TOKEN is missing. Starting only web server for health checks.")
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
