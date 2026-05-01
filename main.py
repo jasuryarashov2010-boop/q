@@ -1442,19 +1442,16 @@ async def add_question_to_test(session: AsyncSession, test_id: int, payload: Dic
 def build_test_summary(test: Test, question_count: int) -> str:
     status = "Faol" if test.is_active else "Nofaol"
     premium = "Premium" if test.is_premium else "Bepul"
+
     return (
-        f"🧪 <b>{esc(test.title)}</b>
-"
-        f"📂 {esc(test.category)}
-"
-        f"🎯 {esc(test.difficulty)}
-"
-        f"📌 Savollar: <b>{question_count}</b>
-"
-        f"📌 Holat: <b>{status}</b>
-"
+        f"🧪 <b>{esc(test.title)}</b>\n"
+        f"📂 {esc(test.category)}\n"
+        f"🎯 {esc(test.difficulty)}\n"
+        f"📌 Savollar: <b>{question_count}</b>\n"
+        f"📌 Holat: <b>{status}</b>\n"
         f"💎 Rejim: <b>{premium}</b>"
     )
+    
 
 
 def build_user_summary(user: User) -> str:
