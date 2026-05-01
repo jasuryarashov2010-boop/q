@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+import json
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -24,7 +25,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram import BaseMiddleware
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio import Redis
 from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, func, select, update, delete
@@ -66,6 +67,26 @@ class Settings(BaseSettings):
         extra="ignore",
         populate_by_name=True,
     )
+
+    @field_validator("admin_ids", mode="before")
+    @classmethod
+    def parse_admin_ids(cls, value: Any) -> List[int]:
+        """Accept JSON list or comma-separated admin IDs."""
+        if value is None or value == "":
+            return []
+        if isinstance(value, list):
+            return [int(item) for item in value]
+        if isinstance(value, tuple):
+            return [int(item) for item in value]
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                parsed = json.loads(raw)
+                return [int(item) for item in parsed]
+            return [int(part.strip()) for part in raw.split(",") if part.strip()]
+        raise ValueError("ADMIN_IDS noto‘g‘ri formatda")
 
 
 settings = Settings()
